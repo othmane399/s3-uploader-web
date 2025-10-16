@@ -1,6 +1,6 @@
 class S3MultipartUploader {
     constructor() {
-        this.partSize = 100 * 1024 * 1024; // 100MB
+        this.partSize = 100 * 1024 * 1024; // Default 100MB, will be set from form
         this.concurrency = 3;
         this.s3 = null;
         this.uploadId = null;
@@ -9,8 +9,12 @@ class S3MultipartUploader {
         this.startTime = null;
         this.file = null;
         this.config = {};
+        this.lastProgressUpdate = 0;
+        this.resumeState = null;
 
         this.initializeUI();
+        this.checkForResumeableUpload();
+        this.setupBucketNameCleaning();
     }
 
     initializeUI() {
@@ -29,6 +33,15 @@ class S3MultipartUploader {
             const file = e.target.files[0];
             if (file) {
                 fileLabel.textContent = `📁 ${file.name} (${this.formatFileSize(file.size)})`;
+                fileLabel.style.borderColor = '#e1e5e9';
+                fileLabel.style.backgroundColor = '';
+                
+                // If we have a resume state and this matches the expected file, show resume option
+                if (this.resumeState && file.name === this.resumeState.fileName && file.size === this.resumeState.fileSize) {
+                    fileLabel.innerHTML = `📁 ${file.name} (${this.formatFileSize(file.size)}) <span style="color: #28a745;">✅ Ready to resume</span>`;
+                    fileLabel.style.borderColor = '#28a745';
+                    fileLabel.style.backgroundColor = '#f8fff8';
+                }
             }
         });
 
@@ -67,6 +80,32 @@ class S3MultipartUploader {
             document.getElementById('overwriteDialog').style.display = 'none';
             this.proceedWithUpload();
         });
+
+        // Resume dialog handlers
+        document.getElementById('cancelResume').addEventListener('click', () => {
+            document.getElementById('resumeDialog').style.display = 'none';
+            this.clearResumeData();
+            this.resumeState = null;
+        });
+
+        document.getElementById('confirmResume').addEventListener('click', () => {
+            document.getElementById('resumeDialog').style.display = 'none';
+            // Pre-fill form with resume data if available
+            if (this.resumeState) {
+                document.getElementById('accessKey').value = this.resumeState.config.accessKey || '';
+                document.getElementById('secretKey').value = this.resumeState.config.secretKey || '';
+                document.getElementById('bucketName').value = this.resumeState.config.bucketName || '';
+                document.getElementById('chunkSize').value = (this.resumeState.partSize / (1024 * 1024)).toString();
+                document.getElementById('objectName').value = this.resumeState.config.objectName || '';
+                
+                // Update file label to show expected file
+                const fileLabel = document.querySelector('.file-input-label');
+                fileLabel.innerHTML = `📁 Please select: <strong>${this.resumeState.fileName}</strong> (${this.formatFileSize(this.resumeState.fileSize)})`;
+                fileLabel.style.borderColor = '#ff9500';
+                fileLabel.style.backgroundColor = '#fff8e1';
+            }
+            // Don't call resumeUpload() immediately, wait for file selection
+        });
     }
 
     async startUpload() {
@@ -74,15 +113,27 @@ class S3MultipartUploader {
             this.clearMessages();
             this.setUploadStatus(true);
 
-            // Get form data
+            // Check if this is a resume attempt
+            const file = document.getElementById('fileInput').files[0];
+            if (this.resumeState && file && file.name === this.resumeState.fileName && file.size === this.resumeState.fileSize) {
+                // This is a resume operation
+                await this.resumeUpload();
+                return;
+            }
+
+            // Regular upload flow
             this.config = {
                 accessKey: document.getElementById('accessKey').value,
                 secretKey: document.getElementById('secretKey').value,
-                region: document.getElementById('region').value,
-                bucketName: document.getElementById('bucketName').value,
+                region: 'eu-central-1', // Default region
+                bucketName: document.getElementById('bucketName').value.replace(/\s/g, ''),
             };
 
-            this.file = document.getElementById('fileInput').files[0];
+            // Set chunk size from dropdown
+            const chunkSizeMB = parseInt(document.getElementById('chunkSize').value);
+            this.partSize = chunkSizeMB * 1024 * 1024;
+
+            this.file = file;
             if (!this.file) {
                 throw new Error('Please select a file');
             }
@@ -109,7 +160,7 @@ class S3MultipartUploader {
     }
 
     async checkObjectExists() {
-        this.updateProgress(0, 'Checking if object exists...');
+        this.updateProgress(0, '🔍 Checking object existence...');
 
         try {
             // Try to list objects with prefix to check existence
@@ -150,6 +201,7 @@ class S3MultipartUploader {
         try {
             this.startTime = Date.now();
             this.uploadedBytes = 0;
+            this.parts = [];
 
             this.updateProgress(0, '🚀 Starting multipart upload...');
 
@@ -161,27 +213,16 @@ class S3MultipartUploader {
 
             this.uploadId = createResult.UploadId;
 
+            // Save initial upload state
+            this.saveUploadState();
+
             // Calculate parts
             const totalParts = Math.ceil(this.file.size / this.partSize);
-            const partPromises = [];
-
-            // Upload parts with concurrency control
+            
+            // Upload parts sequentially with concurrency control
             for (let i = 0; i < totalParts; i++) {
-                if (partPromises.length >= this.concurrency) {
-                    await Promise.race(partPromises);
-                    // Remove completed promises
-                    const completedIndex = partPromises.findIndex(p => p.completed);
-                    if (completedIndex !== -1) {
-                        partPromises.splice(completedIndex, 1);
-                    }
-                }
-
-                const partPromise = this.uploadPart(i + 1, totalParts);
-                partPromises.push(partPromise);
+                await this.uploadPart(i + 1, totalParts);
             }
-
-            // Wait for all parts to complete
-            await Promise.all(partPromises);
 
             // Complete multipart upload
             await this.completeMultipartUpload();
@@ -207,6 +248,7 @@ class S3MultipartUploader {
         const start = (partNumber - 1) * this.partSize;
         const end = Math.min(start + this.partSize, this.file.size);
         const partData = this.file.slice(start, end);
+        const partStartBytes = this.uploadedBytes;
 
         const uploadResult = await this.s3.uploadPart({
             Bucket: this.config.bucketName,
@@ -214,6 +256,18 @@ class S3MultipartUploader {
             PartNumber: partNumber,
             UploadId: this.uploadId,
             Body: partData
+        }).on('httpUploadProgress', (progressEvent) => {
+            // Throttle progress updates to prevent UI lag
+            const now = Date.now();
+            if (now - this.lastProgressUpdate > 100) { // Update max every 100ms
+                this.lastProgressUpdate = now;
+                
+                const partProgress = progressEvent.loaded;
+                const totalUploadedBytes = partStartBytes + partProgress;
+                const progress = (totalUploadedBytes / this.file.size) * 100;
+                
+                this.updateProgress(progress, `📊 Uploading part ${partNumber}/${totalParts}...`);
+            }
         }).promise();
 
         this.parts.push({
@@ -221,14 +275,13 @@ class S3MultipartUploader {
             PartNumber: partNumber
         });
 
-        // Update progress
+        // Update final progress for this part
         this.uploadedBytes += partData.size;
         const progress = (this.uploadedBytes / this.file.size) * 100;
         this.updateProgress(progress, `📊 Uploading part ${partNumber}/${totalParts}...`);
 
-        const promise = Promise.resolve();
-        promise.completed = true;
-        return promise;
+        // Save progress after each part
+        this.saveUploadState();
     }
 
     async completeMultipartUpload() {
@@ -248,6 +301,9 @@ class S3MultipartUploader {
         const avgSpeed = (this.file.size / (totalTime / 1000)) / (1024 * 1024);
 
         this.updateProgress(100, '✅ Upload completed successfully!');
+        
+        // Clear resume data on successful completion
+        this.clearResumeData();
         this.showSuccess(`
             📁 File: ${this.file.name} (${this.formatFileSize(this.file.size)})<br>
             📍 Destination: s3://${this.config.bucketName}/${this.config.objectName}<br>
@@ -277,6 +333,9 @@ class S3MultipartUploader {
             const remainingBytes = this.file.size - this.uploadedBytes;
             const remainingSeconds = remainingBytes / (speed * 1024 * 1024);
             etaElement.textContent = `ETA: ${this.formatTime(remainingSeconds)}`;
+        } else {
+            speedElement.textContent = '0 MB/s';
+            etaElement.textContent = percent >= 100 ? 'Completed' : 'Calculating...';
         }
     }
 
@@ -295,18 +354,24 @@ class S3MultipartUploader {
     showError(message) {
         const errorDiv = document.getElementById('errorMsg');
         errorDiv.className = 'error';
+        errorDiv.style.display = 'block';
         errorDiv.innerHTML = `❌ ${message}`;
     }
 
     showSuccess(message) {
         const successDiv = document.getElementById('successMsg');
         successDiv.className = 'success';
-        successDiv.innerHTML = `✅ ${message}`;
+        successDiv.style.display = 'block';
+        successDiv.innerHTML = message;
     }
 
     clearMessages() {
-        document.getElementById('errorMsg').innerHTML = '';
-        document.getElementById('successMsg').innerHTML = '';
+        const errorDiv = document.getElementById('errorMsg');
+        const successDiv = document.getElementById('successMsg');
+        errorDiv.innerHTML = '';
+        errorDiv.style.display = 'none';
+        successDiv.innerHTML = '';
+        successDiv.style.display = 'none';
         document.getElementById('progressContainer').style.display = 'none';
     }
 
@@ -330,6 +395,177 @@ class S3MultipartUploader {
             const minutes = Math.floor((seconds % 3600) / 60);
             return `${hours}h${minutes.toString().padStart(2, '0')}m`;
         }
+    }
+
+    checkForResumeableUpload() {
+        try {
+            const savedState = localStorage.getItem('s3_upload_state');
+            if (savedState) {
+                this.resumeState = JSON.parse(savedState);
+                this.showResumeDialog();
+            }
+        } catch (error) {
+            console.log('No resumeable upload found');
+            localStorage.removeItem('s3_upload_state');
+        }
+    }
+
+    showResumeDialog() {
+        const dialog = document.getElementById('resumeDialog');
+        const message = document.getElementById('resumeMessage');
+        const progress = ((this.resumeState.uploadedParts.length * this.resumeState.partSize) / this.resumeState.fileSize * 100).toFixed(1);
+        message.innerHTML = `Found interrupted upload for "${this.resumeState.fileName}" (${progress}% completed).<br><br><strong>Please select the same file again to resume the upload.</strong>`;
+        dialog.style.display = 'block';
+    }
+
+    async resumeUpload() {
+        try {
+            console.log('Starting resume upload...');
+            this.clearMessages();
+
+            // Get the selected file
+            const fileInput = document.getElementById('fileInput');
+            this.file = fileInput.files[0];
+            
+            if (!this.file) {
+                throw new Error('Please select a file to resume the upload.');
+            }
+            
+            if (this.file.name !== this.resumeState.fileName) {
+                throw new Error(`Please select the original file "${this.resumeState.fileName}".`);
+            }
+            
+            if (this.file.size !== this.resumeState.fileSize) {
+                throw new Error(`File size mismatch. Expected ${this.formatFileSize(this.resumeState.fileSize)}, got ${this.formatFileSize(this.file.size)}.`);
+            }
+
+            // Restore state
+            this.config = this.resumeState.config;
+            this.uploadId = this.resumeState.uploadId;
+            this.partSize = this.resumeState.partSize;
+            this.parts = this.resumeState.uploadedParts || [];
+            this.uploadedBytes = this.parts.length * this.partSize;
+
+            console.log('Resume state:', {
+                fileName: this.file.name,
+                uploadId: this.uploadId,
+                partSize: this.partSize,
+                existingParts: this.parts.length
+            });
+
+            // Configure AWS SDK
+            AWS.config.update({
+                accessKeyId: this.config.accessKey,
+                secretAccessKey: this.config.secretKey,
+                region: this.config.region
+            });
+            this.s3 = new AWS.S3();
+
+            // Verify upload still exists and get current parts
+            await this.verifyAndResumeUpload();
+
+        } catch (error) {
+            console.error('Resume error:', error);
+            this.showError(`Resume failed: ${error.message}`);
+            this.setUploadStatus(false);
+            this.clearResumeData();
+        }
+    }
+
+    async verifyAndResumeUpload() {
+        this.updateProgress(0, '🔍 Verifying upload state...');
+
+        try {
+            console.log('Verifying upload with:', {
+                bucket: this.config.bucketName,
+                key: this.config.objectName,
+                uploadId: this.uploadId
+            });
+
+            // List existing parts
+            const listResult = await this.s3.listParts({
+                Bucket: this.config.bucketName,
+                Key: this.config.objectName,
+                UploadId: this.uploadId
+            }).promise();
+
+            console.log('S3 ListParts result:', listResult);
+
+            // Update parts list with existing parts from S3
+            this.parts = listResult.Parts ? listResult.Parts.map(part => ({
+                ETag: part.ETag,
+                PartNumber: part.PartNumber
+            })) : [];
+
+            console.log('Existing parts on S3:', this.parts);
+
+            // Calculate uploaded bytes based on actual parts
+            this.uploadedBytes = this.parts.length * this.partSize;
+            
+            this.startTime = Date.now();
+            const currentProgress = (this.uploadedBytes / this.file.size) * 100;
+            this.updateProgress(currentProgress, `📊 Resuming from ${currentProgress.toFixed(1)}%...`);
+
+            // Continue with remaining parts
+            const totalParts = Math.ceil(this.file.size / this.partSize);
+            const startPart = this.parts.length + 1;
+
+            console.log(`Total parts needed: ${totalParts}, starting from part: ${startPart}`);
+
+            if (startPart <= totalParts) {
+                for (let i = startPart; i <= totalParts; i++) {
+                    await this.uploadPart(i, totalParts);
+                }
+            }
+
+            await this.completeMultipartUpload();
+
+        } catch (error) {
+            console.error('Verify and resume error:', error);
+            if (error.code === 'NoSuchUpload') {
+                throw new Error('Upload session expired. Please start a new upload.');
+            }
+            throw error;
+        }
+    }
+
+    saveUploadState() {
+        const uploadState = {
+            uploadId: this.uploadId,
+            fileName: this.file.name,
+            fileSize: this.file.size,
+            partSize: this.partSize,
+            uploadedParts: this.parts,
+            config: {
+                ...this.config,
+                objectName: this.config.objectName || this.file.name
+            }
+        };
+        localStorage.setItem('s3_upload_state', JSON.stringify(uploadState));
+    }
+
+    clearResumeData() {
+        localStorage.removeItem('s3_upload_state');
+    }
+
+    setupBucketNameCleaning() {
+        const bucketNameInput = document.getElementById('bucketName');
+        
+        bucketNameInput.addEventListener('input', (e) => {
+            // Remove spaces automatically as user types
+            const cleanValue = e.target.value.replace(/\s/g, '');
+            if (e.target.value !== cleanValue) {
+                e.target.value = cleanValue;
+            }
+        });
+
+        bucketNameInput.addEventListener('paste', (e) => {
+            // Clean pasted content
+            setTimeout(() => {
+                const cleanValue = e.target.value.replace(/\s/g, '');
+                e.target.value = cleanValue;
+            }, 0);
+        });
     }
 }
 
