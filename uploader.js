@@ -109,6 +109,7 @@ class S3MultipartUploader {
     }
 
     async startUpload() {
+        console.log('startUpload called');
         try {
             this.clearMessages();
             this.setUploadStatus(true);
@@ -134,7 +135,9 @@ class S3MultipartUploader {
             this.partSize = chunkSizeMB * 1024 * 1024;
 
             this.file = file;
+            console.log('Selected file:', this.file);
             if (!this.file) {
+                console.error('No file selected');
                 throw new Error('Please select a file');
             }
 
@@ -154,6 +157,7 @@ class S3MultipartUploader {
             await this.checkObjectExists();
 
         } catch (error) {
+            console.error('Upload error:', error);
             this.showError(error.message);
             this.setUploadStatus(false);
         }
