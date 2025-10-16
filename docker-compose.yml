@@ -1,0 +1,12 @@
+version: '3.8'
+
+services:
+  s3-uploader-web:
+    build: .
+    ports:
+      - "8080:80"
+    container_name: s3-uploader-web
+    restart: unless-stopped
+    environment:
+      - NGINX_HOST=localhost
+      - NGINX_PORT=80
