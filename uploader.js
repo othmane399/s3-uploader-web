@@ -86,6 +86,9 @@ class S3MultipartUploader {
             document.getElementById('resumeDialog').style.display = 'none';
             this.clearResumeData();
             this.resumeState = null;
+            // Unlock chunk size for new upload
+            document.getElementById('chunkSize').disabled = false;
+            document.getElementById('chunkSize').style.backgroundColor = '';
         });
 
         document.getElementById('confirmResume').addEventListener('click', () => {
@@ -104,6 +107,9 @@ class S3MultipartUploader {
                 fileLabel.style.borderColor = '#ff9500';
                 fileLabel.style.backgroundColor = '#fff8e1';
             }
+            // Lock chunk size to prevent issues with existing parts
+            document.getElementById('chunkSize').disabled = true;
+            document.getElementById('chunkSize').style.backgroundColor = '#f5f5f5';
             // Don't call resumeUpload() immediately, wait for file selection
         });
     }
@@ -132,7 +138,14 @@ class S3MultipartUploader {
 
             // Set chunk size from dropdown
             const chunkSizeMB = parseInt(document.getElementById('chunkSize').value);
-            this.partSize = chunkSizeMB * 1024 * 1024;
+            const newPartSize = chunkSizeMB * 1024 * 1024;
+            
+            // Validate chunk size for resume uploads
+            if (this.resumeState && this.resumeState.partSize !== newPartSize) {
+                throw new Error(`Cannot change chunk size during resume. Expected ${this.resumeState.partSize / (1024*1024)}MB, got ${chunkSizeMB}MB`);
+            }
+            
+            this.partSize = newPartSize;
 
             this.file = file;
             console.log('Selected file:', this.file);
